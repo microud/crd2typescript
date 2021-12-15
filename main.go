@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"html/template"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -17,12 +16,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	texttemplate "text/template"
+	"text/template"
 	"time"
 	"unicode"
 
 	"github.com/pkg/errors"
-	"github.com/russross/blackfriday/v2"
 	"k8s.io/gengo/parser"
 	"k8s.io/gengo/types"
 	"k8s.io/klog"
@@ -62,6 +60,8 @@ type generatorConfig struct {
 
 	// GitCommitDisabled causes the git commit information to be excluded from the output.
 	GitCommitDisabled bool `json:"gitCommitDisabled"`
+
+	TypeReplacements map[string]string `json:"typeReplacements"`
 }
 
 type externalPackage struct {
@@ -116,6 +116,11 @@ func resolveTemplateDir(dir string) error {
 }
 
 func main() {
+	wd, err := os.Getwd()
+	if err != nil {
+		klog.Fatalf("failed to local current working directory")
+	}
+	klog.Infof("working directory is %s", wd)
 	defer klog.Flush()
 
 	f, err := os.Open(*flConfig)
@@ -340,6 +345,26 @@ func fieldEmbedded(m types.Member) bool {
 	return strings.Contains(reflect.StructTag(m.Tags).Get("json"), ",inline")
 }
 
+func hasEmbeddedTypes(t types.Type) bool {
+	for _, m := range t.Members {
+		if fieldEmbedded(m) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func embeddedTypes(t types.Type) (ms []types.Member) {
+	for _, member := range t.Members {
+		if fieldEmbedded(member) {
+			ms = append(ms, member)
+		}
+	}
+
+	return
+}
+
 func isLocalType(t *types.Type, typePkgMap map[*types.Type]*apiPackage) bool {
 	t = tryDereference(t)
 	_, ok := typePkgMap[t]
@@ -348,20 +373,16 @@ func isLocalType(t *types.Type, typePkgMap map[*types.Type]*apiPackage) bool {
 
 func renderComments(s []string, markdown bool) string {
 	s = filterCommentTags(s)
+	if len(s) == 0 || (len(s) == 1 && s[0] == "") {
+		return ""
+	}
+
+	for i := range s {
+		s[i] = " * " + s[i]
+	}
 	doc := strings.Join(s, "\n")
 
-	if markdown {
-		// TODO(ahmetb): when a comment includes stuff like "http://<service>"
-		// we treat this as a HTML tag with markdown renderer below. solve this.
-		return string(blackfriday.Run([]byte(doc)))
-	}
-	return nl2br(doc)
-}
-
-func safe(s string) template.HTML { return template.HTML(s) }
-
-func nl2br(s string) string {
-	return strings.Replace(s, "\n\n", string(template.HTML("<br/><br/>")), -1)
+	return "/**\n" + doc + "\n */"
 }
 
 func hiddenMember(m types.Member, c generatorConfig) bool {
@@ -377,6 +398,10 @@ func typeIdentifier(t *types.Type) string {
 	t = tryDereference(t)
 	return t.Name.String() // {PackagePath.Name}
 }
+
+//func enumMembers(t *types.Type) []*types.Type {
+//
+//}
 
 // apiGroupForType looks up apiGroup for the given type
 func apiGroupForType(t *types.Type, typePkgMap map[*types.Type]*apiPackage) string {
@@ -394,57 +419,6 @@ func apiGroupForType(t *types.Type, typePkgMap map[*types.Type]*apiPackage) stri
 // anchorIDForLocalType returns the #anchor string for the local type
 func anchorIDForLocalType(t *types.Type, typePkgMap map[*types.Type]*apiPackage) string {
 	return fmt.Sprintf("%s.%s", apiGroupForType(t, typePkgMap), t.Name.Name)
-}
-
-// linkForType returns an anchor to the type if it can be generated. returns
-// empty string if it is not a local type or unrecognized external type.
-func linkForType(t *types.Type, c generatorConfig, typePkgMap map[*types.Type]*apiPackage) (string, error) {
-	t = tryDereference(t) // dereference kind=Pointer
-
-	if isLocalType(t, typePkgMap) {
-		return "#" + anchorIDForLocalType(t, typePkgMap), nil
-	}
-
-	var arrIndex = func(a []string, i int) string {
-		return a[(len(a)+i)%len(a)]
-	}
-
-	// types like k8s.io/apimachinery/pkg/apis/meta/v1.ObjectMeta,
-	// k8s.io/api/core/v1.Container, k8s.io/api/autoscaling/v1.CrossVersionObjectReference,
-	// github.com/knative/build/pkg/apis/build/v1alpha1.BuildSpec
-	if t.Kind == types.Struct || t.Kind == types.Pointer || t.Kind == types.Interface || t.Kind == types.Alias {
-		id := typeIdentifier(t)                        // gives {{ImportPath.Identifier}} for type
-		segments := strings.Split(t.Name.Package, "/") // to parse [meta, v1] from "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-		for _, v := range c.ExternalPackages {
-			r, err := regexp.Compile(v.TypeMatchPrefix)
-			if err != nil {
-				return "", errors.Wrapf(err, "pattern %q failed to compile", v.TypeMatchPrefix)
-			}
-			if r.MatchString(id) {
-				tpl, err := texttemplate.New("").Funcs(map[string]interface{}{
-					"lower":    strings.ToLower,
-					"arrIndex": arrIndex,
-				}).Parse(v.DocsURLTemplate)
-				if err != nil {
-					return "", errors.Wrap(err, "docs URL template failed to parse")
-				}
-
-				var b bytes.Buffer
-				if err := tpl.
-					Execute(&b, map[string]interface{}{
-						"TypeIdentifier":  t.Name.Name,
-						"PackagePath":     t.Name.Package,
-						"PackageSegments": segments,
-					}); err != nil {
-					return "", errors.Wrap(err, "docs url template execution error")
-				}
-				return b.String(), nil
-			}
-		}
-		klog.Warningf("not found external link source for type %v", t.Name)
-	}
-	return "", nil
 }
 
 // tryDereference returns the underlying type when t is a pointer, map, or slice.
@@ -465,6 +439,21 @@ func finalUnderlyingTypeOf(t *types.Type) *types.Type {
 
 		t = t.Underlying
 	}
+}
+
+func toTypeScriptType(s string) string {
+	switch s {
+	case "int",
+		"int32",
+		"uint",
+		"uint64":
+		s = "number"
+
+	case "bool":
+		s = "boolean"
+	}
+
+	return s
 }
 
 func typeDisplayName(t *types.Type, c generatorConfig, typePkgMap map[*types.Type]*apiPackage) string {
@@ -488,7 +477,7 @@ func typeDisplayName(t *types.Type, c generatorConfig, typePkgMap map[*types.Typ
 		// noop
 	case types.Map:
 		// return original name
-		return t.Name.Name
+		return fmt.Sprintf("Record<%s, %s>", t.Key.Name.Name, toTypeScriptType(t.Elem.Name.Name))
 	case types.DeclarationOf:
 		// For constants, we want to display the value
 		// rather than the name of the constant, since the
@@ -505,6 +494,7 @@ func typeDisplayName(t *types.Type, c generatorConfig, typePkgMap map[*types.Typ
 		}
 		klog.Fatalf("type %s is a non-const declaration, which is unhandled", t.Name)
 	default:
+		//it seems imported third lib types missed here.
 		klog.Fatalf("type %s has kind=%v which is unhandled", t.Name, t.Kind)
 	}
 
@@ -515,8 +505,10 @@ func typeDisplayName(t *types.Type, c generatorConfig, typePkgMap map[*types.Typ
 		}
 	}
 
+	s = toTypeScriptType(s)
+
 	if t.Kind == types.Slice {
-		s = "[]" + s
+		s = s + "[]"
 	}
 
 	return s
@@ -656,6 +648,8 @@ func render(w io.Writer, pkgs []*apiPackage, config generatorConfig) error {
 		"isExportedType":     isExportedType,
 		"fieldName":          fieldName,
 		"fieldEmbedded":      fieldEmbedded,
+		"hasEmbeddedTypes":   hasEmbeddedTypes,
+		"embeddedTypes":      embeddedTypes,
 		"typeIdentifier":     func(t *types.Type) string { return typeIdentifier(t) },
 		"typeDisplayName":    func(t *types.Type) string { return typeDisplayName(t, config, typePkgMap) },
 		"visibleTypes":       func(t []*types.Type) []*types.Type { return visibleTypes(t, config) },
@@ -669,22 +663,23 @@ func render(w io.Writer, pkgs []*apiPackage, config generatorConfig) error {
 			// spaces, so just trim those.
 			return strings.Replace(p.identifier(), " ", "", -1)
 		},
-		"linkForType": func(t *types.Type) string {
-			v, err := linkForType(t, config, typePkgMap)
-			if err != nil {
-				klog.Fatal(errors.Wrapf(err, "error getting link for type=%s", t.Name))
-				return ""
-			}
-			return v
-		},
-		"anchorIDForType":  func(t *types.Type) string { return anchorIDForLocalType(t, typePkgMap) },
-		"safe":             safe,
 		"sortedTypes":      sortTypes,
 		"typeReferences":   func(t *types.Type) []*types.Type { return typeReferences(t, config, references) },
 		"hiddenMember":     func(m types.Member) bool { return hiddenMember(m, config) },
 		"isLocalType":      isLocalType,
 		"isOptionalMember": isOptionalMember,
 		"constantsOfType":  func(t *types.Type) []*types.Type { return constantsOfType(t, typePkgMap[t]) },
+		"constantsType": func(t *types.Type) string {
+			typs := constantsOfType(t, typePkgMap[t])
+			var values []string
+			for _, typ := range typs {
+				if typ.ConstValue != nil {
+					values = append(values, fmt.Sprintf("'%s'", *typ.ConstValue))
+				}
+			}
+
+			return strings.Join(values, " | ")
+		},
 	}).ParseGlob(filepath.Join(*flTemplateDir, "*.tpl"))
 	if err != nil {
 		return errors.Wrap(err, "parse error")
