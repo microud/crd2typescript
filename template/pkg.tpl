@@ -1,10 +1,10 @@
 {{ define "packages" }}
 
-type ObjectMetadata = {
-  name: string;
-  resourceVersion: string;
-  labels: Record<string, string>;
-}
+        type ObjectMetadata = {
+          name: string;
+          resourceVersion: string;
+          labels: Record<string, string>;
+        }
 
         {{- range .packages -}}
           {{ range (visibleTypes (sortedTypes .Types))}}
