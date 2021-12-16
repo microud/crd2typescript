@@ -3,7 +3,13 @@
   {{ range .Members }}
     {{ if not (hiddenMember .)}}
       {{ if not (fieldEmbedded .) }}
-        {{ renderComments .CommentLines }}
+        {{ if hasComments .CommentLines }}
+        /**
+         {{ range .CommentLines }}
+         * {{ . }}
+         {{ end }}
+         */
+        {{ end }}
         {{ fieldName . }}{{ if isOptionalMember . }}?{{ end }}: {{ typeDisplayName .Type }};
       {{ end }}
     {{ end }}

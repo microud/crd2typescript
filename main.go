@@ -5,25 +5,20 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/pkg/errors"
 	"io"
 	"io/ioutil"
-	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"reflect"
-	"regexp"
-	"sort"
-	"strconv"
-	"strings"
-	"text/template"
-	"time"
-	"unicode"
-
-	"github.com/pkg/errors"
 	"k8s.io/gengo/parser"
 	"k8s.io/gengo/types"
 	"k8s.io/klog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"text/template"
+	"time"
 )
 
 var (
@@ -31,8 +26,9 @@ var (
 	flAPIDir      = flag.String("api-dir", "", "api directory (or import path), point this to pkg/apis")
 	flTemplateDir = flag.String("template-dir", "template", "path to template/ dir")
 
-	flHTTPAddr = flag.String("http-addr", "", "start an HTTP server on specified addr to view the result (e.g. :8080)")
-	flOutFile  = flag.String("out-file", "", "path to output file to save the result")
+	flHTTPAddr           = flag.String("http-addr", "", "start an HTTP server on specified addr to view the result (e.g. :8080)")
+	flOutFile            = flag.String("out-file", "", "path to output file to save the result")
+	runtimeExternalTypes []*types.Type
 )
 
 const (
@@ -51,22 +47,15 @@ type generatorConfig struct {
 	// link to them.
 	ExternalPackages []externalPackage `json:"externalPackages"`
 
-	// TypeDisplayNamePrefixOverrides is a mapping of how to override displayed
-	// name for types with certain prefixes with what value.
-	TypeDisplayNamePrefixOverrides map[string]string `json:"typeDisplayNamePrefixOverrides"`
-
-	// MarkdownDisabled controls markdown rendering for comment lines.
-	MarkdownDisabled bool `json:"markdownDisabled"`
-
-	// GitCommitDisabled causes the git commit information to be excluded from the output.
-	GitCommitDisabled bool `json:"gitCommitDisabled"`
+	ExternalTypes map[string]map[string]string `json:"externalTypes"`
 
 	TypeReplacements map[string]string `json:"typeReplacements"`
+
+	SliceTemplate string `json:"sliceTemplate"`
 }
 
 type externalPackage struct {
 	TypeMatchPrefix string `json:"typeMatchPrefix"`
-	DocsURLTemplate string `json:"docsURLTemplate"`
 }
 
 type apiPackage struct {
@@ -325,66 +314,6 @@ func findTypeReferences(pkgs []*apiPackage) map[*types.Type][]*types.Type {
 	return m
 }
 
-func isExportedType(t *types.Type) bool {
-	// TODO(ahmetb) use types.ExtractSingleBoolCommentTag() to parse +genclient
-	// https://godoc.org/k8s.io/gengo/types#ExtractCommentTags
-	return strings.Contains(strings.Join(t.SecondClosestCommentLines, "\n"), "+genclient")
-}
-
-func fieldName(m types.Member) string {
-	v := reflect.StructTag(m.Tags).Get("json")
-	v = strings.TrimSuffix(v, ",omitempty")
-	v = strings.TrimSuffix(v, ",inline")
-	if v != "" {
-		return v
-	}
-	return m.Name
-}
-
-func fieldEmbedded(m types.Member) bool {
-	return strings.Contains(reflect.StructTag(m.Tags).Get("json"), ",inline")
-}
-
-func hasEmbeddedTypes(t types.Type) bool {
-	for _, m := range t.Members {
-		if fieldEmbedded(m) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func embeddedTypes(t types.Type) (ms []types.Member) {
-	for _, member := range t.Members {
-		if fieldEmbedded(member) {
-			ms = append(ms, member)
-		}
-	}
-
-	return
-}
-
-func isLocalType(t *types.Type, typePkgMap map[*types.Type]*apiPackage) bool {
-	t = tryDereference(t)
-	_, ok := typePkgMap[t]
-	return ok
-}
-
-func renderComments(s []string, markdown bool) string {
-	s = filterCommentTags(s)
-	if len(s) == 0 || (len(s) == 1 && s[0] == "") {
-		return ""
-	}
-
-	for i := range s {
-		s[i] = " * " + s[i]
-	}
-	doc := strings.Join(s, "\n")
-
-	return "/**\n" + doc + "\n */"
-}
-
 func hiddenMember(m types.Member, c generatorConfig) bool {
 	for _, v := range c.HiddenMemberFields {
 		if m.Name == v {
@@ -392,177 +321,6 @@ func hiddenMember(m types.Member, c generatorConfig) bool {
 		}
 	}
 	return false
-}
-
-func typeIdentifier(t *types.Type) string {
-	t = tryDereference(t)
-	return t.Name.String() // {PackagePath.Name}
-}
-
-//func enumMembers(t *types.Type) []*types.Type {
-//
-//}
-
-// apiGroupForType looks up apiGroup for the given type
-func apiGroupForType(t *types.Type, typePkgMap map[*types.Type]*apiPackage) string {
-	t = tryDereference(t)
-
-	v := typePkgMap[t]
-	if v == nil {
-		klog.Warningf("WARNING: cannot read apiVersion for %s from type=>pkg map", t.Name.String())
-		return "<UNKNOWN_API_GROUP>"
-	}
-
-	return v.identifier()
-}
-
-// anchorIDForLocalType returns the #anchor string for the local type
-func anchorIDForLocalType(t *types.Type, typePkgMap map[*types.Type]*apiPackage) string {
-	return fmt.Sprintf("%s.%s", apiGroupForType(t, typePkgMap), t.Name.Name)
-}
-
-// tryDereference returns the underlying type when t is a pointer, map, or slice.
-func tryDereference(t *types.Type) *types.Type {
-	for t.Elem != nil {
-		t = t.Elem
-	}
-	return t
-}
-
-// finalUnderlyingTypeOf walks the type hierarchy for t and returns
-// its base type (i.e. the type that has no further underlying type).
-func finalUnderlyingTypeOf(t *types.Type) *types.Type {
-	for {
-		if t.Underlying == nil {
-			return t
-		}
-
-		t = t.Underlying
-	}
-}
-
-func toTypeScriptType(s string) string {
-	switch s {
-	case "int",
-		"int32",
-		"uint",
-		"uint64":
-		s = "number"
-
-	case "bool":
-		s = "boolean"
-	}
-
-	return s
-}
-
-func typeDisplayName(t *types.Type, c generatorConfig, typePkgMap map[*types.Type]*apiPackage) string {
-	s := typeIdentifier(t)
-
-	if isLocalType(t, typePkgMap) {
-		s = tryDereference(t).Name.Name
-	}
-
-	if t.Kind == types.Pointer {
-		s = strings.TrimLeft(s, "*")
-	}
-
-	switch t.Kind {
-	case types.Struct,
-		types.Interface,
-		types.Alias,
-		types.Pointer,
-		types.Slice,
-		types.Builtin:
-		// noop
-	case types.Map:
-		// return original name
-		return fmt.Sprintf("Record<%s, %s>", t.Key.Name.Name, toTypeScriptType(t.Elem.Name.Name))
-	case types.DeclarationOf:
-		// For constants, we want to display the value
-		// rather than the name of the constant, since the
-		// value is what users will need to write into YAML
-		// specs.
-		if t.ConstValue != nil {
-			u := finalUnderlyingTypeOf(t)
-			// Quote string constants to make it clear to the documentation reader.
-			if u.Kind == types.Builtin && u.Name.Name == "string" {
-				return strconv.Quote(*t.ConstValue)
-			}
-
-			return *t.ConstValue
-		}
-		klog.Fatalf("type %s is a non-const declaration, which is unhandled", t.Name)
-	default:
-		//it seems imported third lib types missed here.
-		klog.Fatalf("type %s has kind=%v which is unhandled", t.Name, t.Kind)
-	}
-
-	// substitute prefix, if registered
-	for prefix, replacement := range c.TypeDisplayNamePrefixOverrides {
-		if strings.HasPrefix(s, prefix) {
-			s = strings.Replace(s, prefix, replacement, 1)
-		}
-	}
-
-	s = toTypeScriptType(s)
-
-	if t.Kind == types.Slice {
-		s = s + "[]"
-	}
-
-	return s
-}
-
-func hideType(t *types.Type, c generatorConfig) bool {
-	for _, pattern := range c.HideTypePatterns {
-		if regexp.MustCompile(pattern).MatchString(t.Name.String()) {
-			return true
-		}
-	}
-	if !isExportedType(t) && unicode.IsLower(rune(t.Name.Name[0])) {
-		// types that start with lowercase
-		return true
-	}
-	return false
-}
-
-func typeReferences(t *types.Type, c generatorConfig, references map[*types.Type][]*types.Type) []*types.Type {
-	var out []*types.Type
-	m := make(map[*types.Type]struct{})
-	for _, ref := range references[t] {
-		if !hideType(ref, c) {
-			m[ref] = struct{}{}
-		}
-	}
-	for k := range m {
-		out = append(out, k)
-	}
-	sortTypes(out)
-	return out
-}
-
-func sortTypes(typs []*types.Type) []*types.Type {
-	sort.Slice(typs, func(i, j int) bool {
-		t1, t2 := typs[i], typs[j]
-		if isExportedType(t1) && !isExportedType(t2) {
-			return true
-		} else if !isExportedType(t1) && isExportedType(t2) {
-			return false
-		}
-		return t1.Name.String() < t2.Name.String()
-	})
-	return typs
-}
-
-func visibleTypes(in []*types.Type, c generatorConfig) []*types.Type {
-	var out []*types.Type
-	for _, t := range in {
-		if !hideType(t, c) {
-			out = append(out, t)
-		}
-	}
-	return out
 }
 
 func packageDisplayName(pkg *types.Package, apiVersions map[string]string) string {
@@ -624,22 +382,6 @@ func packageMapToList(pkgs map[string]*apiPackage) []*apiPackage {
 	return out
 }
 
-// constantsOfType finds all the constants in pkg that have the
-// same underlying type as t. This is intended for use by enum
-// type validation, where users need to specify one of a specific
-// set of constant values for a field.
-func constantsOfType(t *types.Type, pkg *apiPackage) []*types.Type {
-	constants := []*types.Type{}
-
-	for _, c := range pkg.Constants {
-		if c.Underlying == t {
-			constants = append(constants, c)
-		}
-	}
-
-	return sortTypes(constants)
-}
-
 func render(w io.Writer, pkgs []*apiPackage, config generatorConfig) error {
 	references := findTypeReferences(pkgs)
 	typePkgMap := extractTypeToPackageMap(pkgs)
@@ -653,7 +395,8 @@ func render(w io.Writer, pkgs []*apiPackage, config generatorConfig) error {
 		"typeIdentifier":     func(t *types.Type) string { return typeIdentifier(t) },
 		"typeDisplayName":    func(t *types.Type) string { return typeDisplayName(t, config, typePkgMap) },
 		"visibleTypes":       func(t []*types.Type) []*types.Type { return visibleTypes(t, config) },
-		"renderComments":     func(s []string) string { return renderComments(s, !config.MarkdownDisabled) },
+		"hasComments":        hasComments,
+		"renderComments":     func(s []string) string { return renderComments(s) },
 		"packageDisplayName": func(p *apiPackage) string { return p.identifier() },
 		"apiGroup":           func(t *types.Type) string { return apiGroupForType(t, typePkgMap) },
 		"packageAnchorID": func(p *apiPackage) string {
@@ -685,14 +428,8 @@ func render(w io.Writer, pkgs []*apiPackage, config generatorConfig) error {
 		return errors.Wrap(err, "parse error")
 	}
 
-	var gitCommit []byte
-	if !config.GitCommitDisabled {
-		gitCommit, _ = exec.Command("git", "rev-parse", "--short", "HEAD").Output()
-	}
-
 	return errors.Wrap(t.ExecuteTemplate(w, "packages", map[string]interface{}{
-		"packages":  pkgs,
-		"config":    config,
-		"gitCommit": strings.TrimSpace(string(gitCommit)),
+		"packages": pkgs,
+		"config":   config,
 	}), "template execution error")
 }
