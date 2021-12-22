@@ -29,5 +29,5 @@
     "uint32": "number",
     "bool": "boolean"
   },
-  "sliceTemplate": "{{type}}[]"
+  "sliceTemplate": "{{.type}}[]"
 }
